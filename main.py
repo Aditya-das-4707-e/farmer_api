@@ -1,25 +1,42 @@
+import logging
 import re
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional
 
+from gov_client import fetch_average_for_candidates, get_api_key
+from mapper import candidates_for
+import price_cache
+
+logger = logging.getLogger("farmer_api")
+
 app = FastAPI(
     title="Indian Market Price API",
-    description="Search product name, get general market price. Example: /products/?name=rice. Plural-tolerant: potato/potatos/potatoes all work.",
-    version="3.0.0",
+    description=(
+        "Search product name, get market price. Example: /products/?name=rice. "
+        "Live Agmarknet (data.gov.in) all-India average in Rs/kg where available, "
+        "static fallback otherwise. Plural-tolerant: potato/potatos/potatoes all work."
+    ),
+    version="4.0.0",
 )
 
-# ---------------- Model: market price only (no farmer) ----------------
+# ---------------- Model: market price + live govt meta ----------------
 
 class ProductPrice(BaseModel):
     id: int
     product_name: str
     hindi_name: Optional[str] = None
     bengali_name: Optional[str] = None
-    market_price_per_kg: float  # INR per unit - general market rate
+    market_price_per_kg: float  # INR per unit - live modal avg if available else static
     unit: str = "kg"
     currency: str = "INR"
     market_price: Optional[str] = None  # e.g. "Rs 28 per kg"
+    source: Optional[str] = None  # live | cache | static_fallback
+    arrival_date: Optional[str] = None  # latest govt arrival_date DD/MM/YYYY
+    markets_count: Optional[int] = None
+    min_price_per_kg: Optional[float] = None
+    max_price_per_kg: Optional[float] = None
+    matched_commodity: Optional[str] = None  # govt commodity used
 
 
 # ---------------- Data: (name, hindi, bengali, price, unit) ----------------
@@ -523,12 +540,168 @@ def find_all_by_product(name: str) -> List[ProductPrice]:
     return candidates
 
 
-# ---------------- Routes (search only) ----------------
+# ---------------- Live govt price resolution ----------------
+# Govt modal/min/max are Rs/quintal wholesale. Local users want Rs/kg:
+#   per_kg = quintal / 100. `unit` stays as curated (kg/litre/piece) for compat;
+#   litre/piece items are mostly static_fallback anyway (no mandi series).
+
+def _quintal_to_unit(quintal: float, unit: str) -> float:
+    # Mandi series are per-quintal weight. For kg items divide by 100.
+    # For litre/piece curated items we still divide by 100 when live data
+    # exists (rare) to keep Rs/unit comparable; static fallback otherwise.
+    try:
+        v = float(quintal) / 100.0
+    except (TypeError, ValueError):
+        return quintal
+    return round(v, 2)
+
+
+def resolve_live_price(product_name: str, static_price: float, unit: str, state: str = "") -> dict:
+    """Return live-enriched price dict, or static fallback.
+
+    Cache layers:
+      1. product-level cache (fast for repeated ?name=)
+      2. govt-commodity cache inside fetch path via price_cache
+    """
+    norm_key = normalize_name(product_name)
+    # 1. product cache hit (live hits return as cache; static stays static)
+    hit = price_cache.get_by_product_cache_key(norm_key, state)
+    if hit:
+        d = dict(hit)
+        if d.get("source") == "static_fallback":
+            return d
+        d["source"] = "cache"
+        return d
+    # 2. no API key -> static immediately (keeps API working keyless)
+    if not get_api_key():
+        return {"price": static_price, "source": "static_fallback", "reason": "no API key"}
+    # 3. live lookup across candidate govt commodities
+    try:
+        cands = candidates_for(product_name)
+    except Exception as e:
+        logger.warning("mapper failed for %s: %s", product_name, e)
+        return {"price": static_price, "source": "static_fallback"}
+    # check per-candidate cache first (shares across variants: all mangoes -> Mango)
+    for c in cands:
+        cached = price_cache.get(c, state)
+        if cached:
+            avg = dict(cached)
+            price = _quintal_to_unit(avg["avg_modal_quintal"], unit)
+            out = {
+                "price": price,
+                "source": "cache",
+                "arrival_date": avg.get("arrival_date"),
+                "markets_count": avg.get("markets_count"),
+                "min_price_per_kg": _quintal_to_unit(avg.get("min_quintal"), unit),
+                "max_price_per_kg": _quintal_to_unit(avg.get("max_quintal"), unit),
+                "matched_commodity": avg.get("matched_commodity", c),
+            }
+            price_cache.set_by_product_cache_key(norm_key, state, out)
+            return out
+    # 4. fetch from govt API (tries candidates in order)
+    try:
+        avg = fetch_average_for_candidates(cands, state=state)
+    except Exception as e:
+        logger.warning("gov fetch failed for %s %s: %s", product_name, cands, e)
+        static_out = {"price": static_price, "source": "static_fallback"}
+        try:
+            price_cache.set_by_product_cache_key(norm_key, state, static_out)
+        except Exception:
+            pass
+        return static_out
+    if not avg:
+        static_out = {"price": static_price, "source": "static_fallback"}
+        try:
+            price_cache.set_by_product_cache_key(norm_key, state, static_out)
+        except Exception:
+            pass
+        return static_out
+    # cache under matched commodity for sibling products + product key
+    try:
+        price_cache.set(avg.get("matched_commodity", cands[0]), state, avg)
+    except Exception:
+        pass
+    price = _quintal_to_unit(avg["avg_modal_quintal"], unit)
+    out = {
+        "price": price,
+        "source": "live",
+        "arrival_date": avg.get("arrival_date"),
+        "markets_count": avg.get("markets_count"),
+        "min_price_per_kg": _quintal_to_unit(avg.get("min_quintal"), unit),
+        "max_price_per_kg": _quintal_to_unit(avg.get("max_quintal"), unit),
+        "matched_commodity": avg.get("matched_commodity"),
+    }
+    try:
+        price_cache.set_by_product_cache_key(norm_key, state, out)
+    except Exception:
+        pass
+    return out
+
+
+def enrich_with_live(products: List[ProductPrice], state: str = "", live: bool = True) -> List[ProductPrice]:
+    # De-duplicate govt fetches: resolve unique product names once per request
+    memo: dict = {}
+    for p in products:
+        key = (normalize_name(p.product_name), state, live)
+        if key not in memo:
+            if not live:
+                memo[key] = {"price": p.market_price_per_kg, "source": "static_fallback"}
+            else:
+                memo[key] = resolve_live_price(p.product_name, p.market_price_per_kg, p.unit, state)
+        info = memo[key]
+        # IMPORTANT: copy before mutating - products_db objects are shared across requests
+        # (find_all_by_product returns references). Mutating them leaks prices between users.
+        # We replace the list entry via index below, but easiest: mutate a copy.
+        # Caller handles copy; here we just attach fields to a cloned object.
+        # (cloning done in route; this keeps logic simple if reused elsewhere)
+        p.market_price_per_kg = float(info.get("price", p.market_price_per_kg))
+        p.source = info.get("source")
+        p.arrival_date = info.get("arrival_date")
+        p.markets_count = info.get("markets_count")
+        p.min_price_per_kg = info.get("min_price_per_kg")
+        p.max_price_per_kg = info.get("max_price_per_kg")
+        p.matched_commodity = info.get("matched_commodity")
+        p.market_price = f"Rs {p.market_price_per_kg:g} per {p.unit}"
+    return products
+
+
+# ---------------- Routes ----------------
+
+@app.get("/")
+def root():
+    return {
+        "message": "Indian Market Price API - live Agmarknet average (Rs/kg) + static fallback",
+        "version": "4.0.0",
+        "endpoints": ["/products/?name=onion", "/health", "/cache/stats", "/docs"],
+        "source": "Agmarknet via data.gov.in (DMI) + curated fallback",
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "has_api_key": bool(get_api_key()), "cache": price_cache.stats()}
+
+
+@app.get("/cache/stats")
+def cache_stats():
+    return price_cache.stats()
+
+
+@app.post("/cache/refresh")
+def cache_refresh():
+    n = price_cache.clear()
+    return {"cleared": n}
+
 
 @app.get("/products/", response_model=List[ProductPrice])
-def search_product(name: str = Query(..., description="Product name e.g. rice, wheat, onion. Plural-tolerant: potato, potatos, potatoes all work. Generic: egg -> poultry egg + duck egg, honey -> all honeys.")):
+def search_product(
+    name: str = Query(..., description="Product name e.g. rice, wheat, onion. Plural-tolerant: potato, potatos, potatoes all work. Generic: egg -> poultry egg + duck egg, honey -> all honeys."),
+    state: str = Query("", description="Optional state filter for live average, e.g. Punjab. Default empty = all-India average."),
+    live: bool = Query(True, description="Set live=false to force curated static prices."),
+):
     """
     User puts product name, market price(s) come.
+    Live: all-India modal average from govt mandis converted to Rs/kg.
     Example: GET /products/?name=potato  -> [potato]
              GET /products/?name=egg     -> [poultry egg, duck egg]
              GET /products/?name=honey   -> [raw honey, mustard honey, ...]
@@ -536,7 +709,8 @@ def search_product(name: str = Query(..., description="Product name e.g. rice, w
     results = find_all_by_product(name)
     if not results:
         raise HTTPException(status_code=404, detail=f"No product found with name '{name}'")
-    # Add Rs formatted price, e.g. "Rs 28 per kg"
-    for r in results:
-        r.market_price = f"Rs {r.market_price_per_kg:g} per {r.unit}"
+    # Copy: find_all_by_product returns shared refs from products_db; enrich mutates
+    import copy as _copy
+    results = [_copy.deepcopy(r) for r in results]
+    enrich_with_live(results, state=state.strip(), live=live)
     return results
